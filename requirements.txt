@@ -1,0 +1,14 @@
+docling>=2.40,<3
+torch
+pypdfium2>=4.30
+requests>=2.32
+pandas>=2.2
+openpyxl>=3.1
+xlrd>=2.0
+pyxlsb>=1.0
+odfpy>=1.4
+extract-msg>=0.48
+beautifulsoup4>=4.12
+charset-normalizer>=3.3
+pillow>=10.4
+pillow-heif>=0.18
