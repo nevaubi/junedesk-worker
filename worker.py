@@ -29,6 +29,7 @@ from pathlib import Path
 import requests
 
 from convert import Child, Output, Permanent, convert, sha256_file
+from render import render
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("worker")
@@ -140,12 +141,7 @@ def finish(job: dict, out: Output, sha: str):
         api("complete", {**base, "children": n, "meta": meta})
         return
     if out.uploads:
-        names = list(out.uploads)
-        urls: dict[str, str] = {}
-        for i in range(0, len(names), 200):
-            urls.update(api("sign", {"jobId": job_id, "files": names[i:i + 200]})["urls"])
-        for rel, local in out.uploads.items():
-            put_file(urls[rel], local, "application/pdf" if rel.endswith(".pdf") else "audio/mpeg" if rel.endswith(".mp3") else "image/jpeg")
+        upload_derivatives(job_id, out.uploads)
     if out.audio_units:
         api("complete", {**base, "audioUnits": out.audio_units, "meta": meta})
         return
@@ -164,6 +160,26 @@ def finish(job: dict, out: Output, sha: str):
     api("complete", payload)
 
 
+CONTENT_TYPES = {".pdf": "application/pdf", ".json": "application/json", ".mp3": "audio/mpeg", ".jpg": "image/jpeg"}
+
+
+def upload_derivatives(job_id: str, uploads: dict[str, Path]):
+    names = list(uploads)
+    urls: dict[str, str] = {}
+    for i in range(0, len(names), 200):
+        urls.update(api("sign", {"jobId": job_id, "files": names[i:i + 200]})["urls"])
+    for rel, local in uploads.items():
+        put_file(urls[rel], local, CONTENT_TYPES.get(Path(rel).suffix, "application/octet-stream"))
+
+
+def process_render(job: dict, src: Path, work: Path, hb: "Heartbeat"):
+    """Build the document's true view (view.pdf, spreadsheet grid or scan word boxes) and report what was made."""
+    out = render(src, job["doc"], job["mode"], work)
+    hb.progress = 0.8
+    upload_derivatives(job["jobId"], out.uploads)
+    api("complete", {"jobId": job["jobId"], "rendered": out.summary})
+
+
 def process(job: dict):
     job_id = job["jobId"]
     doc = job["doc"]
@@ -177,6 +193,10 @@ def process(job: dict):
         src = work / f"original.{ext}"
         log.info("job %s: %s (%.1f MB)", job_id, doc["name"], (doc.get("bytes") or 0) / 1048576)
         download(job["downloadUrl"], src)
+        if job.get("stage") == "render":
+            process_render(job, src, work, hb)
+            log.info("job %s: view rendered in %.0fs", job_id, time.time() - started)
+            return
         sha = sha256_file(src)
         out = convert(src, doc, work, lambda f: setattr(hb, "progress", f))
         # Email attachments become their own documents; they are registered while the job is still leased.
@@ -192,7 +212,8 @@ def process(job: dict):
         safe_fail(job_id, str(e), True)
     except Exception as e:  # retryable
         log.exception("job %s failed", job_id)
-        safe_fail(job_id, "Something went wrong while reading this file on the processing worker. It will be retried.", False)
+        msg = "Could not prepare the original-layout view." if job.get("stage") == "render" else "Something went wrong while reading this file on the processing worker. It will be retried."
+        safe_fail(job_id, msg, False)
     finally:
         hb.done.set()
         shutil.rmtree(work, ignore_errors=True)
