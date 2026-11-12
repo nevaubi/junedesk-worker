@@ -10,6 +10,7 @@ Environment:
   JUNEDESK_URL          e.g. https://case-cosmos-research-desk.lovable.app
   JUNEDESK_WORKER_KEY   the same value saved in JuneDesk as JUNEDESK_WORKER_KEY
   WORKER_CONCURRENCY    files processed at once (default 1; use 2 on 4 GB+ instances)
+  TICK_SECONDS          how often to run JuneDesk's background work (default 240)
 """
 from __future__ import annotations
 
@@ -226,6 +227,46 @@ def safe_fail(job_id: str, message: str, permanent: bool):
         log.error("could not report failure for %s: %s", job_id, e)
 
 
+TICK_SECONDS = int(os.environ.get("TICK_SECONDS", "240"))
+TICK_STEPS = ["sweep", "documents", "analyses", "memos", "drafts", "witness", "tracker", "productions", "compilations", "causelists", "precedent"]
+
+
+def tick_step(step: str) -> None:
+    try:
+        r = session.post(f"{URL}/api/public/worker/tick", json={"step": step}, headers={"Authorization": f"Bearer {KEY}"}, timeout=200)
+        text = r.text.strip()
+        if r.status_code >= 300 or not text.endswith("}"):
+            log.warning("tick %s: %s %s", step, r.status_code, text[:200] or "(cut off)")
+        elif '"ok":false' in text:
+            log.warning("tick %s: %s", step, text[:300])
+        elif any(f'":{n}' in text for n in range(1, 10)):  # only log steps that did something
+            log.info("tick %s: %s", step, text[:300])
+    except Exception as e:
+        log.warning("tick %s failed: %s", step, e)
+
+
+def ticker():
+    """JuneDesk's background clock: every few minutes asks the app to run each background step in turn (documents,
+    analyses, memos, drafts, witness grids, tracker, productions, compilations, cause lists, precedent checks) and waits
+    for each to finish. The app's own scheduler hangs up after a few seconds, so it cannot run these itself."""
+    stopping.wait(20)
+    steps = TICK_STEPS
+    try:
+        r = session.post(f"{URL}/api/public/worker/tick", json={"step": "list"}, headers={"Authorization": f"Bearer {KEY}"}, timeout=30)
+        if r.ok and isinstance(r.json().get("steps"), list):
+            steps = [str(x) for x in r.json()["steps"]]
+    except Exception as e:
+        log.warning("tick: could not read steps (%s), using defaults", e)
+    log.info("tick: %d background steps every %ds", len(steps), TICK_SECONDS)
+    while not stopping.is_set():
+        began = time.time()
+        for step in steps:
+            if stopping.is_set():
+                break
+            tick_step(step)
+        stopping.wait(max(30, TICK_SECONDS - (time.time() - began)))
+
+
 def main():
     if not URL or len(KEY) < 24:
         log.error("Set JUNEDESK_URL and JUNEDESK_WORKER_KEY (at least 24 characters).")
@@ -233,6 +274,7 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: stopping.set())
     signal.signal(signal.SIGINT, lambda *_: stopping.set())
     log.info("JuneDesk worker started: %s, concurrency %d", URL, CONCURRENCY)
+    threading.Thread(target=ticker, name="tick", daemon=True).start()
     idle = IDLE_SLEEP[0]
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
         running: set = set()
