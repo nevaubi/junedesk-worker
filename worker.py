@@ -11,6 +11,7 @@ Environment:
   JUNEDESK_WORKER_KEY   the same value saved in JuneDesk as JUNEDESK_WORKER_KEY
   WORKER_CONCURRENCY    files processed at once (default 1; use 2 on 4 GB+ instances)
   TICK_SECONDS          how often to run JuneDesk's background work (default 240)
+  FRESH_EVERY_HOURS     how often to add newly released judgments to search (default 24; 0 switches it off)
 """
 from __future__ import annotations
 
@@ -227,13 +228,14 @@ def safe_fail(job_id: str, message: str, permanent: bool):
         log.error("could not report failure for %s: %s", job_id, e)
 
 
+VERSION = "2026.11.13"  # keep equal to EXPECTED_WORKER_VERSION in src/lib/jobs/versions.ts
 TICK_SECONDS = int(os.environ.get("TICK_SECONDS", "240"))
-TICK_STEPS = ["sweep", "documents", "analyses", "memos", "drafts", "witness", "tracker", "productions", "compilations", "causelists", "precedent"]
+TICK_STEPS = ["sweep", "documents", "analyses", "memos", "drafts", "witness", "tracker", "productions", "compilations", "causelists", "precedent", "releases"]
 
 
 def tick_step(step: str) -> None:
     try:
-        r = session.post(f"{URL}/api/public/worker/tick", json={"step": step}, headers={"Authorization": f"Bearer {KEY}"}, timeout=200)
+        r = session.post(f"{URL}/api/public/worker/tick", json={"step": step}, headers={"Authorization": f"Bearer {KEY}", "X-Worker-Version": VERSION}, timeout=200)
         text = r.text.strip()
         if r.status_code >= 300 or not text.endswith("}"):
             log.warning("tick %s: %s %s", step, r.status_code, text[:200] or "(cut off)")
@@ -267,14 +269,50 @@ def ticker():
         stopping.wait(max(30, TICK_SECONDS - (time.time() - began)))
 
 
+FRESH_EVERY_HOURS = float(os.environ.get("FRESH_EVERY_HOURS", "24"))
+
+
+def fresher():
+    """Daily releases: about once a day runs fresh.py (new Supreme Court / High Court judgments into search) in its own process,
+    so its memory is returned when it ends. The last run time is kept in JuneDesk storage, so restarts do not repeat a run."""
+    if FRESH_EVERY_HOURS <= 0:
+        log.info("fresh: daily releases are switched off (FRESH_EVERY_HOURS=0)")
+        return
+    import subprocess
+    stopping.wait(600)
+    while not stopping.is_set():
+        due = True
+        try:
+            import fresh
+            runs = (fresh.read_json("search/v2/fresh/state.json") or {}).get("runs") or []
+            if runs:
+                import calendar
+                last = calendar.timegm(time.strptime(runs[-1]["at"], "%Y-%m-%dT%H:%M:%SZ"))
+                due = time.time() - last >= FRESH_EVERY_HOURS * 3600
+        except Exception as e:
+            log.warning("fresh: could not read the last run (%s)", e)
+            due = False
+        if due:
+            log.info("fresh: starting the daily release check")
+            try:
+                out = subprocess.run([sys.executable, "-u", "fresh.py"], capture_output=True, text=True, timeout=4 * 3600)
+                log.info("fresh: finished (%s) %s", out.returncode, (out.stdout or "").strip()[-400:])
+                if out.returncode:
+                    log.warning("fresh: %s", (out.stderr or "").strip()[-1500:])
+            except subprocess.TimeoutExpired:
+                log.warning("fresh: stopped after 4 hours; the next run continues where it left off")
+        stopping.wait(3600)
+
+
 def main():
     if not URL or len(KEY) < 24:
         log.error("Set JUNEDESK_URL and JUNEDESK_WORKER_KEY (at least 24 characters).")
         sys.exit(2)
     signal.signal(signal.SIGTERM, lambda *_: stopping.set())
     signal.signal(signal.SIGINT, lambda *_: stopping.set())
-    log.info("JuneDesk worker started: %s, concurrency %d", URL, CONCURRENCY)
+    log.info("JuneDesk worker %s started: %s, concurrency %d", VERSION, URL, CONCURRENCY)
     threading.Thread(target=ticker, name="tick", daemon=True).start()
+    threading.Thread(target=fresher, name="fresh", daemon=True).start()
     idle = IDLE_SLEEP[0]
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
         running: set = set()

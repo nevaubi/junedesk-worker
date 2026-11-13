@@ -21,7 +21,7 @@ RUN pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requir
 # Fetch Docling's layout and table models at build time so the first file doesn't wait for downloads.
 RUN docling-tools models download layout tableformer || echo "model prefetch skipped; models download on first use"
 
-COPY convert.py render.py worker.py ./
+COPY convert.py render.py worker.py fresh.py ./
 RUN useradd --create-home worker && mkdir -p /models && chown -R worker /app /models
 USER worker
 

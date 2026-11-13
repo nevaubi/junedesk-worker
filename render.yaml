@@ -1,0 +1,18 @@
+# Render Blueprint: one background worker. Deploy with "New > Blueprint" and point it at this folder's repository.
+services:
+  - type: worker
+    name: junedesk-worker
+    runtime: docker
+    rootDir: render-worker
+    dockerfilePath: ./Dockerfile
+    plan: standard        # 2 GB RAM is the minimum for Docling; use "pro" (4 GB) with WORKER_CONCURRENCY=2 for big batches
+    autoDeploy: true
+    envVars:
+      - key: JUNEDESK_URL
+        value: https://case-cosmos-research-desk.lovable.app
+      - key: JUNEDESK_WORKER_KEY
+        sync: false        # paste the same key you saved in JuneDesk
+      - key: WORKER_CONCURRENCY
+        value: "1"
+      - key: DOCLING_MAX_PAGES
+        value: "400"       # longer PDFs use fast text extraction (tables kept as text)

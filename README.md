@@ -44,6 +44,14 @@ You can run more than one worker instance; they never pick up the same file twic
 | `MAX_SHEET_ROWS` | 150000 | Searchable rows per spreadsheet |
 | `AUDIO_CHUNK_SECONDS` | 600 | Length of each transcription piece |
 | `USE_DOCLING` | 1 | Set to 0 to use fast text extraction only |
+| `FRESH_EVERY_HOURS` | 24 | How often new Supreme Court / High Court judgments are taken from the public release (0 switches it off) |
+| `FRESH_MAX_DOCS` | 20000 | Most new judgments added in one run (the rest follow in the next run) |
+| `FRESH_PROCS` | 2 | PDF text readers used by the daily run |
+
+The daily run (`fresh.py`) runs in its own process: it reads the release metadata changed since the last run, skips judgments
+already in the library (same CNR or case number with the same decision date, give or take a day, or the same neutral citation),
+reads each PDF's text, builds one small search segment and asks JuneDesk to publish it. JuneDesk checks the segment against
+its summary before it becomes searchable, and only lets the worker write files of the next free segment.
 
 ## Run locally (optional)
 
