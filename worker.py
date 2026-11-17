@@ -228,8 +228,10 @@ def safe_fail(job_id: str, message: str, permanent: bool):
         log.error("could not report failure for %s: %s", job_id, e)
 
 
-VERSION = "2026.11.13"  # keep equal to EXPECTED_WORKER_VERSION in src/lib/jobs/versions.ts
+VERSION = "2026.11.17"  # keep equal to EXPECTED_WORKER_VERSION in src/lib/jobs/versions.ts
 TICK_SECONDS = int(os.environ.get("TICK_SECONDS", "240"))
+AGENT_TICK_SECONDS = float(os.environ.get("AGENT_TICK_SECONDS", "8"))
+CATALOG_REFRESH_SECONDS = int(os.environ.get("CATALOG_REFRESH_SECONDS", "1800"))
 TICK_STEPS = ["sweep", "documents", "analyses", "memos", "drafts", "witness", "tracker", "productions", "compilations", "causelists", "precedent", "releases"]
 
 
@@ -247,26 +249,74 @@ def tick_step(step: str) -> None:
         log.warning("tick %s failed: %s", step, e)
 
 
+_catalog = {"steps": list(TICK_STEPS), "fast": [], "at": 0.0}
+
+
+def refresh_catalog() -> None:
+    """Re-read the app's step list; a failed or malformed read keeps the last good list."""
+    try:
+        r = session.post(f"{URL}/api/public/worker/tick", json={"step": "list"}, headers={"Authorization": f"Bearer {KEY}", "X-Worker-Version": VERSION}, timeout=30)
+        body = r.json() if r.ok else None
+        steps = body.get("steps") if isinstance(body, dict) else None
+        if isinstance(steps, list) and steps and all(isinstance(x, str) and len(x) < 40 for x in steps):
+            fast = body.get("fast") if isinstance(body.get("fast"), list) else []
+            changed = steps != _catalog["steps"] or fast != _catalog["fast"]
+            _catalog.update(steps=[str(x) for x in steps], fast=[str(x) for x in fast if isinstance(x, str) and len(x) < 40])
+            if changed:
+                log.info("tick: catalogue %d steps, fast lane %s", len(_catalog["steps"]), _catalog["fast"] or "none")
+        else:
+            log.warning("tick: step list unreadable (%s), keeping the last good list", r.status_code)
+    except Exception as e:
+        log.warning("tick: could not read steps (%s), keeping the last good list", e)
+    _catalog["at"] = time.time()
+
+
 def ticker():
     """JuneDesk's background clock: every few minutes asks the app to run each background step in turn (documents,
     analyses, memos, drafts, witness grids, tracker, productions, compilations, cause lists, precedent checks) and waits
-    for each to finish. The app's own scheduler hangs up after a few seconds, so it cannot run these itself."""
+    for each to finish. The app's own scheduler hangs up after a few seconds, so it cannot run these itself. The step list
+    is re-read periodically (keeping the last good one), so new app steps start without a worker restart."""
     stopping.wait(20)
-    steps = TICK_STEPS
-    try:
-        r = session.post(f"{URL}/api/public/worker/tick", json={"step": "list"}, headers={"Authorization": f"Bearer {KEY}"}, timeout=30)
-        if r.ok and isinstance(r.json().get("steps"), list):
-            steps = [str(x) for x in r.json()["steps"]]
-    except Exception as e:
-        log.warning("tick: could not read steps (%s), using defaults", e)
-    log.info("tick: %d background steps every %ds", len(steps), TICK_SECONDS)
+    refresh_catalog()
+    log.info("tick: %d background steps every %ds", len(_catalog["steps"]), TICK_SECONDS)
     while not stopping.is_set():
         began = time.time()
-        for step in steps:
+        if began - _catalog["at"] >= CATALOG_REFRESH_SECONDS:
+            refresh_catalog()
+        for step in list(_catalog["steps"]):
             if stopping.is_set():
                 break
             tick_step(step)
         stopping.wait(max(30, TICK_SECONDS - (time.time() - began)))
+
+
+def agent_lane():
+    """Separate quick lane for durable assistant tasks: every few seconds asks the app to advance runnable runs by one
+    bounded step each, so slow maintenance steps never delay them. Only runs while the app lists a fast step."""
+    lane = requests.Session()
+    stopping.wait(25)
+    quiet = 0.0
+    while not stopping.is_set():
+        fast = list(_catalog["fast"])
+        if not fast:
+            stopping.wait(30)
+            continue
+        began = time.time()
+        for step in fast:
+            try:
+                r = lane.post(f"{URL}/api/public/worker/tick", json={"step": step}, headers={"Authorization": f"Bearer {KEY}", "X-Worker-Version": VERSION}, timeout=200)
+                text = r.text.strip()
+                if r.status_code == 400:
+                    quiet = 120.0  # the app does not know this step yet (older release): back off quietly
+                elif r.status_code >= 300 or not text.endswith("}"):
+                    log.warning("agents %s: %s %s", step, r.status_code, text[:200] or "(cut off)")
+                elif '"claimed":0' not in text:
+                    log.info("agents %s: %s", step, text[:300])
+            except Exception as e:
+                log.warning("agents %s failed: %s", step, e)
+        wait = quiet or max(2.0, AGENT_TICK_SECONDS - (time.time() - began))
+        quiet = 0.0
+        stopping.wait(wait)
 
 
 FRESH_EVERY_HOURS = float(os.environ.get("FRESH_EVERY_HOURS", "24"))
@@ -312,6 +362,7 @@ def main():
     signal.signal(signal.SIGINT, lambda *_: stopping.set())
     log.info("JuneDesk worker %s started: %s, concurrency %d", VERSION, URL, CONCURRENCY)
     threading.Thread(target=ticker, name="tick", daemon=True).start()
+    threading.Thread(target=agent_lane, name="agents", daemon=True).start()
     threading.Thread(target=fresher, name="fresh", daemon=True).start()
     idle = IDLE_SLEEP[0]
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
